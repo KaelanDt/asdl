@@ -91,6 +91,7 @@ def im2col_2d_slow(x: torch.Tensor, conv2d: nn.Module):
 def cholesky_inv(X, damping=1e-7):
     diag = torch.diagonal(X)
     diag += damping
+    print('cholesky inverse performed')
     u = torch.linalg.cholesky(X)
     diag -= damping
     return torch.cholesky_inverse(u)

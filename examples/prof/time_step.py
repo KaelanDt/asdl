@@ -6,12 +6,13 @@ import torch
 from torch.nn.functional import mse_loss
 import torchvision
 
-from asdfghjkl import KfacGradientMaker, FISHER_EMP, LOSS_MSE
-from asdfghjkl import empirical_natural_gradient
-from asdfghjkl import LBFGS
-from asdfghjkl.precondition import Shampoo
+from asdl import KfacGradientMaker, FISHER_EMP, LOSS_MSE, PreconditioningConfig
+from asdl import empirical_natural_gradient
+from asdl import shampoo
+from torch.functional import F 
 import profiling
 import models
+from time import time
 
 
 # yapf: disable
@@ -20,7 +21,7 @@ parser.add_argument('--input_size', type=str, default='32,32',
                     help='input size')
 parser.add_argument('--optim', type=str, default='kfac',
                     help='name of the optimizer')
-parser.add_argument('--arch', type=str,
+parser.add_argument('--arch', type=str, default='resnet18',
                     help='name of the architecture')
 parser.add_argument('--arch_args', type=json.loads, default={},
                     help='[JSON] arguments for the architecture')
@@ -28,7 +29,7 @@ parser.add_argument('--num_blocks', type=int, default=None)
 parser.add_argument('--width_scale', type=int, default=None)
 parser.add_argument('--num_iters', type=int, default=100,
                     help='number of benchmark iterations')
-parser.add_argument('--num_warmups', type=int, default=5,
+parser.add_argument('--num_warmups', type=int, default=0,
                     help='number of warmup iterations')
 parser.add_argument('--config', default=None, nargs='+',
                     help='config YAML file path')
@@ -99,26 +100,57 @@ def time_shampoo():
                          num_warmups=args.num_warmups)
 
 
-def time_kfac():
-    ng = KfacGradientMaker(model, FISHER_EMP, loss_type=LOSS_MSE, damping=1.)
+def time_kfac(batch_size):
+    config = PreconditioningConfig(data_size=batch_size, damping=1e-3, ema_decay=0)
+    gm = KfacGradientMaker(model, config)
     optimizer = torch.optim.SGD(model.parameters(), lr=1)
+    dummy_y = gm.setup_model_call(model, x)
+    gm.setup_loss_call(F.mse_loss, dummy_y, t)
 
-    def fwd_bwd_upd_curv():
-        ng.refresh_curvature(x, t, calc_emp_loss_grad=True)
+    def fwd_bwd():
+        gm.forward()
+        gm.backward()
+    
+    def upd_curv():
+        gm.update_curvature()
 
     def upd_inv():
-        ng.update_preconditioner()
+        gm.update_preconditioner()
 
     def precond():
-        ng.precondition()
+        gm.precondition()
 
     def upd_param():
         optimizer.step()
 
-    profiling.time_funcs([fwd_bwd_upd_curv, upd_inv, precond, upd_param],
-                         emit_nvtx=args.emit_nvtx,
-                         num_iters=args.num_iters,
-                         num_warmups=args.num_warmups)
+    start_time = time()
+    fwd_bwd()
+    fwd_bwd_time = time() - start_time
+    print('fwd_bwd: ', time() - start_time)
+
+    start_time = time()
+    upd_curv()
+    upd_curv_time = time() - start_time
+    print('upd_curv: ', time() - start_time)
+
+    start_time = time()
+    upd_inv()
+    upd_inv_time = time() - start_time
+    print('upd_inv: ', time() - start_time)
+
+    start_time = time()
+    precond()
+    precond_time = time() - start_time
+    print('precond: ', time() - start_time)
+
+    start_time = time()
+    upd_param()
+    upd_param_time = time() - start_time
+    print('upd_param: ', time() - start_time)
+    #profiling.time_funcs([fwd_bwd_upd_curv, upd_inv, precond, upd_param],
+    #                     emit_nvtx=args.emit_nvtx,
+    #                     num_iters=args.num_iters,
+    #                     num_warmups=args.num_warmups)
 
 
 def time_smw():
@@ -187,6 +219,8 @@ if __name__ == '__main__':
             with open(path) as f:
                 config = yaml.full_load(f)
             dict_args.update(config)
+    
+    print(args)
 
     for key in ['num_blocks', 'width_scale']:
         if dict_args[key] is not None:
@@ -218,7 +252,7 @@ if __name__ == '__main__':
     elif args.optim == 'shampoo':
         time_shampoo()
     elif args.optim == 'kfac':
-        time_kfac()
+        time_kfac(batch_size=input_size[0])
     elif args.optim == 'smw':
         time_smw()
     elif args.optim == 'lbfgs':
@@ -231,5 +265,7 @@ if __name__ == '__main__':
         wandb.init(config=dict_args)
         summary = {'max_memory_allocated': max_memory,
                    'num_params': sum(p.numel() for p in model.parameters())}
+    
+        time = {}
         wandb.summary.update(summary)
 
